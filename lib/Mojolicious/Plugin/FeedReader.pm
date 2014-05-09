@@ -1,12 +1,13 @@
 package Mojolicious::Plugin::FeedReader;
 use Mojo::Base 'Mojolicious::Plugin';
 
-our $VERSION = '0.02';
+our $VERSION = '0.04';
 use Mojo::Util qw(decode slurp trim);
 use Mojo::DOM;
 use Mojo::IOLoop;
 use HTTP::Date;
-use Carp "croak";
+use Carp qw(carp croak);
+use Scalar::Util qw(blessed);
 
 our @time_fields
   = (qw(pubDate published created issued updated modified dc\:date));
@@ -23,63 +24,81 @@ our %is_feed = map { $_ => 1 } @feed_types;
 sub register {
   my ($self, $app) = @_;
   foreach my $method (
-    qw( find_feeds parse_rss parse_rss_dom parse_rss_channel parse_rss_item ))
+    qw( find_feeds parse_rss parse_opml ))
   {
     $app->helper($method => \&{$method});
   }
+  $app->helper(parse_feed => \&parse_rss);
+}
+
+sub make_dom {
+  my ($xml) = @_;
+  my $rss;
+  if (!ref $xml) {    # assume file
+    $rss = slurp $xml;
+    die "Unable to read file $xml: $!" unless ($rss);
+  }
+  elsif (ref $xml eq 'SCALAR') {    # assume string
+    $rss = $$xml;
+  }
+  elsif (blessed $xml && $xml->isa('Mojo::DOM')) { # Mojo::DOM (old style)
+    return $xml;
+  }
+  elsif (blessed $xml && $xml->can('slurp')) { # Mojo::Asset or similar
+    $rss = $xml->slurp;
+  }
+  else {
+    die "don't know how to make a Mojo::DOM from object $xml";
+  }
+  my $rss_str = decode 'UTF-8', $rss;
+  die "Failed to read asset $xml (as UTF-8): $!" unless ($rss_str);
+  return Mojo::DOM->new->parse($rss_str);
 }
 
 sub parse_rss {
   my ($c, $xml, $cb) = @_;
-  my $dom;
-  if (!ref $xml) {    # assume file
-    my $rss_str = decode 'UTF-8', slurp $xml;
-    die "Failed to read file $xml (as UTF-8): $!" unless ($rss_str);
-    $dom = Mojo::DOM->new->parse($rss_str);
-  }
-  elsif (ref $xml eq 'SCALAR') {    # assume string
-    $dom = Mojo::DOM->new->parse($$xml);
-  }
-  elsif ($xml->can('slurp')) {      # assume Mojo::Asset
-    my $rss_str = decode 'UTF-8', $xml->slurp;
-    die "Failed to read asset $xml (as UTF-8): $!" unless ($rss_str);
-    $dom = Mojo::DOM->new->parse($rss_str);
-  }
-  elsif ($xml->isa('Mojo::DOM')) {
-    $dom = $xml;
-  }
-  elsif ($xml->isa('Mojo::URL')) {
-
+  if (blessed $xml && $xml->isa('Mojo::URL')) {
     # this is the only case where we might go non-blocking:
-    if ($cb) {
+    if ($cb && ref $cb eq 'CODE') {
+      return
       $c->ua->get(
         $xml,
         sub {
           my ($ua, $tx) = @_;
           my $feed;
           if ($tx->success) {
-            eval { $feed = $c->parse_rss_dom($tx->res->dom); };
+            my $body = $tx->res->body;
+            my $dom = make_dom(\$body);
+            eval { $feed = parse_rss_dom($dom); };
           }
           $c->$cb($feed);
         }
       );
     }
     else {
-      $dom = $c->ua->get($xml)->res->dom;
+      my $tx = $c->ua->get($xml);
+      if ($tx->success) {
+        my $body = $tx->res->body;
+        $xml = \$body;
+      }
+      else {
+        carp "Error getting feed from url $xml: ", (($tx->error) ? $tx->error : '');
+      }
     }
   }
-  return ($dom) ? $c->parse_rss_dom($dom) : 1;
+  my $dom = make_dom($xml);
+  return ($dom) ? parse_rss_dom($dom) : 1;
 }
 
 sub parse_rss_dom {
-  my ($self, $dom) = @_;
+  my ($dom) = @_;
   die "Argument $dom is not a Mojo::DOM" unless ($dom->isa('Mojo::DOM'));
-  my $feed    = $self->parse_rss_channel($dom);    # Feed properties
+  my $feed    = parse_rss_channel($dom);    # Feed properties
   my $items   = $dom->find('item');
   my $entries = $dom->find('entry');               # Atom
   my $res     = [];
   foreach my $item ($items->each, $entries->each) {
-    push @$res, $self->parse_rss_item($item);
+    push @$res, parse_rss_item($item);
   }
   if (@$res) {
     $feed->{'items'} = $res;
@@ -88,7 +107,7 @@ sub parse_rss_dom {
 }
 
 sub parse_rss_channel {
-  my ($self, $dom) = @_;
+  my ($dom) = @_;
   my %info;
   foreach my $k (
     qw{title subtitle description tagline link:not([rel]) link[rel=alternate] dc\:creator author webMaster},
@@ -136,7 +155,7 @@ sub parse_rss_channel {
 }
 
 sub parse_rss_item {
-  my ($self, $item) = @_;
+  my ($item) = @_;
   my %h;
   foreach my $k (
     qw(title id summary guid content description content\:encoded xhtml\:body dc\:creator author),
@@ -223,42 +242,6 @@ sub parse_rss_item {
   return \%h;
 }
 
-sub req_info {
-  my ($tx) = pop;
-  my %info = (url => $tx->req->url);
-  if (my $res = $tx->success) {
-    $info{'code'} = $res->code;
-    if ($res->code == 200) {
-      my $headers = $res->headers;
-      my ($last_modified, $etag) = ($headers->last_modified, $headers->etag);
-      if ($last_modified) {
-        $info{last_modified} = $last_modified;
-      }
-      if ($etag) {
-        $info{etag} = $etag;
-      }
-    }
-    else {
-      $info{'error'} = $tx->res->message;    # for not modified etc.
-    }
-  }
-  else {
-    my ($err, $code) = $tx->error;
-    $info{'code'} = $code if ($code);
-    $info{'error'} = $err;
-  }
-  return \%info;
-}
-
-# set request conditional headers from saved last_modified and etag headers
-sub set_req_headers {
-  my $h = pop;
-  my %headers;
-  $headers{'If-Modified-Since'} = $h->{last_modified} if ($h->{last_modified});
-  $headers{'If-None-Match'}     = $h->{etag}          if ($h->{etag});
-  return %headers;
-}
-
 # find_feeds - get RSS/Atom feed URL from argument.
 # Code adapted to use Mojolicious from Feed::Find by Benjamin Trott
 # Any stupid mistakes are my own
@@ -266,10 +249,11 @@ sub find_feeds {
   my $self = shift;
   my $url  = shift;
   my $cb   = (ref $_[-1] eq 'CODE') ? pop @_ : undef;
-  $self->ua->max_redirects(5)->connect_timeout(30);
+#  $self->ua->max_redirects(5)->connect_timeout(30);
   my $main = sub {
     my ($tx) = @_;
     my @feeds;
+    if ($tx->success) { say $tx->res->code } else { say $tx->error };
     return unless ($tx->success && $tx->res->code == 200);
     eval { @feeds = _find_feed_links($self, $tx->req->url, $tx->res); };
     if ($@) {
@@ -333,12 +317,42 @@ sub _find_feed_links {
       );
     unless (@feeds)
     {    # call me crazy, but maybe this is just a feed served as HTML?
-      if (parse_rss_dom($self, $res->dom)) {
+      my $body = $res->body;
+      if ($self->parse_feed(\$body)) {
         push @feeds, Mojo::URL->new($url)->to_abs;
       }
     }
   }
   return @feeds;
+}
+
+sub parse_opml {
+  my ($self, $opml_file) = @_;
+  my $opml_str = decode 'UTF-8',
+    (ref $opml_file) ? $opml_file->slurp : slurp $opml_file;
+  my $d = Mojo::DOM->new->parse($opml_str);
+  my (%subscriptions, %categories);
+  for my $item ($d->find(q{outline})->each) {
+    my $node = $item->attr;
+    if (!defined $node->{xmlUrl}) {
+      my $cat = $node->{title} || $node->{text};
+      $categories{$cat} = $item->children->pluck('attr', 'xmlUrl');
+    }
+    else {    # file by RSS URL:
+      $subscriptions{$node->{xmlUrl}} = $node;
+    }
+  }
+
+
+  # assign categories
+  for my $cat (keys %categories) {
+    for my $rss ($categories{$cat}->each) {
+      next unless ($subscriptions{$rss}); # don't auto-vivify for empty "categories"
+      $subscriptions{$rss}{'categories'} ||= [];
+      push @{$subscriptions{$rss}{'categories'}}, $cat;
+    }
+  }
+  return (values %subscriptions);
 }
 
 
@@ -362,7 +376,7 @@ Mojolicious::Plugin::FeedReader - Mojolicious plugin to find and parse RSS & Ato
         get '/b' => sub {
           my $self = shift;
           my ($feed) = $self->find_feeds(q{search.cpan.org});
-          my $out = $self->parse_rss($feed);
+          my $out = $self->parse_feed($feed);
           $self->render(template => 'uploads', items => $out->{items});
         };
 
@@ -376,7 +390,7 @@ Mojolicious::Plugin::FeedReader - Mojolicious plugin to find and parse RSS & Ato
             },
             sub {
               my $feed = pop;
-              $self->parse_rss($feed, shift->begin);
+              $self->parse_feed($feed, shift->begin);
             },
             sub {
                 my $data = pop;
@@ -442,29 +456,29 @@ B<Mojolicious::Plugin::FeedReader> implements the following helpers.
 A Mojolicious port of L<Feed::Find> by Benjamin Trott. This helper implements feed auto-discovery for finding syndication feeds, given a URI.
 If given a callback function as an additional argument, execution will be non-blocking.
 
-=head2 parse_rss
+=head2 parse_feed
 
-  # parse an RSS feed
+  # parse an RSS/Atom feed
   # blocking
   my $url = Mojo::URL->new('http://rss.slashdot.org/Slashdot/slashdot');
-  my $feed = $self->parse_rss($url);
+  my $feed = $self->parse_feed($url);
   for my $item (@{$feed->{items}}) {
     say $_ for ($item->{title}, $item->{description}, 'Tags: ' . join q{,}, @{$item->{tags}});
   }
 
   # non-blocking
-  $self->parse_rss($url, sub {
+  $self->parse_feed($url, sub {
     my ($c, $feed) = @_;
-    $c->render(text => "Feed tagline: " . $feed->{tagline});
+    $c->render(text =>L"Feed tagline: " . $feed->{tagline});
   });
 
   # parse a file
-  $feed2 = $self->parse_rss('/downloads/foo.rss');
+  $feed2 = $self->parse_feed('/downloads/foo.rss');
 
-  # parse response DOM
+  # parse response
   $self->ua->get($feed_url, sub {
     my ($ua, $tx) = @_;
-    my $feed = $self->parse_rss($tx->res->dom);
+    my $feed = $self->parse_feed($tx->res);
   });
 
 A minimalist liberal RSS/Atom parser, using Mojo::DOM queries.
@@ -523,7 +537,7 @@ Each item in the items array is a hashref with the following keys:
 
 =head1 CREDITS
 
-Some tests adapted from L<Feed::Find> and L<XML::Feed>. Feed autodiscovery adapted from l<Feed::Find>.
+Some tests adapted from L<Feed::Find> and L<XML:Feed> Feed autodiscovery adapted from L<Feed::Find>.
 
 Test data (web pages, feeds and excerpts) included in this package is intended for testing purposes only, and is not meant in anyway
 to infringe on the rights of the respective authors.

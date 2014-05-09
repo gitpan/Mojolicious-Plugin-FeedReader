@@ -27,4 +27,4 @@ resources:
   bugtracker: http://github.com/dotandimet/Mojolicious-Plugin-FeedReader/issues
   license: http://www.opensource.org/licenses/artistic-license-2.0
   repository: http://github.com/dotandimet/Mojolicious-Plugin-FeedReader
-version: 0.02
+version: 0.04
