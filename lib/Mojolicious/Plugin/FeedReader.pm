@@ -1,7 +1,7 @@
 package Mojolicious::Plugin::FeedReader;
 use Mojo::Base 'Mojolicious::Plugin';
 
-our $VERSION = '0.04';
+our $VERSION = '0.05';
 use Mojo::Util qw(decode slurp trim);
 use Mojo::DOM;
 use Mojo::IOLoop;
@@ -50,7 +50,8 @@ sub make_dom {
   else {
     die "don't know how to make a Mojo::DOM from object $xml";
   }
-  my $rss_str = decode 'UTF-8', $rss;
+  #my $rss_str = decode 'UTF-8', $rss;
+  my $rss_str = $rss;
   die "Failed to read asset $xml (as UTF-8): $!" unless ($rss_str);
   return Mojo::DOM->new->parse($rss_str);
 }
@@ -253,7 +254,7 @@ sub find_feeds {
   my $main = sub {
     my ($tx) = @_;
     my @feeds;
-    if ($tx->success) { say $tx->res->code } else { say $tx->error };
+#    if ($tx->success) { say $tx->res->code } else { say $tx->error };
     return unless ($tx->success && $tx->res->code == 200);
     eval { @feeds = _find_feed_links($self, $tx->req->url, $tx->res); };
     if ($@) {
@@ -291,7 +292,7 @@ sub _find_feed_links {
   else {
     # we are in a web page. PHEAR.
     my $base = Mojo::URL->new(
-      $res->dom->find('head base')->pluck('attr', 'href')->join('') || $url);
+      $res->dom->find('head base')->pluck('attr', 'href')->join('') || $url)->to_abs($url);
     my $title
       = $res->dom->find('head > title')->pluck('text')->join('') || $url;
     $res->dom->find('head link')->each(
@@ -469,7 +470,7 @@ If given a callback function as an additional argument, execution will be non-bl
   # non-blocking
   $self->parse_feed($url, sub {
     my ($c, $feed) = @_;
-    $c->render(text =>L"Feed tagline: " . $feed->{tagline});
+    $c->render(text => "Feed tagline: " . $feed->{tagline});
   });
 
   # parse a file
@@ -535,11 +536,24 @@ Each item in the items array is a hashref with the following keys:
 
 =back
 
+=head2 parse_opml
+
+  my @subscriptions = app->parse_opml( 'mysubs.opml' );
+  foreach my $sub (@subscriptions) {
+    say 'RSS URL is: ',     $sub->{xmlUrl};
+    say 'Website URL is: ', $sub->{htmlUrl};
+    say 'categories: ', join ',', @{$sub->{categories}};
+  }
+
+Parse an OPML subscriptions file and return the list of feeds as an array of hashrefs.
+
+Each hashref will contain an array ref in the key 'categories' listing the folders (parent nodes) in the OPML tree the subscription item appears in.
+
 =head1 CREDITS
 
 Some tests adapted from L<Feed::Find> and L<XML:Feed> Feed autodiscovery adapted from L<Feed::Find>.
 
-Test data (web pages, feeds and excerpts) included in this package is intended for testing purposes only, and is not meant in anyway
+Test data (web pages, feeds and excerpts) included in this package is intended for testing purposes only, and is not meant in any way
 to infringe on the rights of the respective authors.
 
 =head1 COPYRIGHT AND LICENSE

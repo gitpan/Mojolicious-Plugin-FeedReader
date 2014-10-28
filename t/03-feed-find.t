@@ -14,6 +14,7 @@ get '/floo' => sub { shift->redirect_to('/link1.html'); };
 my $samples = File::Spec->catdir($FindBin::Bin, 'samples');
 push @{app->static->paths}, $samples;
 get '/olaf' =>sub { shift->render(data => slurp(File::Spec->catfile($samples, 'atom.xml')), format => 'html'); };
+get '/monks' =>sub { shift->render(data => slurp(File::Spec->catfile($samples, 'perlmonks.html')), format => 'htm'); };
 
 my $t = Test::Mojo->new(app);
 
@@ -47,16 +48,18 @@ is( $feeds[0],  'http://example.com/foo.rss' );
 is( $feeds[1],  'http://example.com/foo.xml' );
 
 # Does it work the same non-blocking?
+@feeds = ();
 my $delay = Mojo::IOLoop->delay( sub {
   shift;
-  my (@feeds) = @_;
-  is( scalar @feeds, 3);
-is( $feeds[0],  'http://www.example.com/?feed=rss2' ); # abs url!
-is( $feeds[1],  'http://www.example.com/?feed=rss' ); # abs url!
-is( $feeds[2],  'http://www.example.com/?feed=atom' ); # abs url!
+  (@feeds) = @_;
 } );
 $t->app->find_feeds('/link2_multi.html', $delay->begin(0));
 $delay->wait unless (Mojo::IOLoop->is_running);
+is( scalar @feeds, 3);
+is( $feeds[0],  'http://www.example.com/?feed=rss2' ); # abs url!
+is( $feeds[1],  'http://www.example.com/?feed=rss' ); # abs url!
+is( $feeds[2],  'http://www.example.com/?feed=atom' ); # abs url!
+
 # Let's try something with redirects:
 $t->get_ok('/floo')->status_is(302);
 (@feeds) = $t->app->find_feeds('/floo');
@@ -78,16 +81,30 @@ is(scalar @feeds, 1);
 is(Mojo::URL->new($feeds[0])->path, '/olaf', 'feed served as html');
 
 # we should get more info with non-blocking:
-
-$delay = Mojo::IOLoop->delay(sub {
-  shift;
-  my (@feeds) = @_;
-  is(scalar @feeds, 0, 'no feeds');
-});
+@feeds = ();
+$delay = Mojo::IOLoop->delay(sub { shift; (@feeds) = @_; });
 
 $t->app->find_feeds('/no_link.html', $delay->begin(0) );
-$delay->wait unless (Mojo::IOLoop->is_running);
+$delay->wait;
+is(scalar @feeds, 0, 'no feeds (nb)');
 
+@feeds = ();
+$t->app->find_feeds('/monks');
+is(scalar @feeds, 0, 'no feeds for perlmonks');
+@feeds = ();
+$delay = Mojo::IOLoop->delay(sub { shift; (@feeds) = @_; });
+$t->app->find_feeds('/monks', $delay->begin(0));
+$delay->wait;
+is(scalar @feeds, 0, 'no feeds for perlmonks (nb)');
+
+# @feeds = ();
+# $delay = Mojo::IOLoop->delay(sub { shift; (@feeds) = @_; });
+# $t->app->find_feeds('slashdot.org', $delay->begin(0));
+# $delay->wait();
+# is(scalar @feeds, 1, 'feed for slashdot');
+# @feeds = ();
+# @feeds = $t->app->find_feeds('slashdot.org');
+# is(scalar @feeds, 1, 'feed for slashdot');
 
 
 done_testing();
